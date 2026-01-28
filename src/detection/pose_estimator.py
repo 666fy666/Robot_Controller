@@ -6,7 +6,7 @@ import numpy as np
 import pyrealsense2 as rs
 from scipy.spatial.transform import Rotation as R
 from ..config.detection_config import (
-    ROBOT_INITIAL_POSE, TOOL_LENGTH, Z_OFFSET, X_OFFSET, Y_OFFSET,
+    TOOL_LENGTH, Z_OFFSET, X_OFFSET, Y_OFFSET,
     DETECT_EULER_ORDER, NORMAL_NEIGHBORHOOD_SIZE, MIN_POINTS_FOR_NORMAL,
     ENABLE_NORMAL_ESTIMATION, DEPTH_FILTER_THRESHOLD
 )
@@ -27,22 +27,32 @@ class PoseEstimator:
         """
         self.R_cam2gripper = R_cam2gripper
         self.t_cam2gripper = t_cam2gripper
+        # 注意：Eye-in-hand 场景下 base->cam 并非固定，这里保留该字段仅用于兼容旧接口。
+        # 正确的做法是在每次计算时基于“当前机器人TCP位姿”实时计算 R_base2cam。
         self.R_base2cam = R_base2cam
         self.intrinsics = intrinsics
-        
-        # 初始化位姿相关矩阵
-        rx, ry, rz = ROBOT_INITIAL_POSE[3:6]
-        self.r_init = R.from_euler(DETECT_EULER_ORDER, [rx, ry, rz], degrees=True)
-        self.R_base2gripper_init = self.r_init.as_matrix()
-        self.t_base2gripper_init = np.array(ROBOT_INITIAL_POSE[0:3]).reshape(3, 1)
+
+    @staticmethod
+    def _pose_to_base2gripper(pose):
+        """
+        将机器人TCP位姿 [x, y, z, rx, ry, rz] 转为 gripper->base 旋转和平移。
+
+        说明：项目里历史命名为 R_base2gripper，但在使用上它表示“gripper坐标系到base坐标系”的旋转。
+        """
+        rx, ry, rz = pose[3:6]
+        r = R.from_euler(DETECT_EULER_ORDER, [rx, ry, rz], degrees=True)
+        R_base2gripper = r.as_matrix()
+        t_base2gripper = np.array(pose[0:3], dtype=float).reshape(3, 1)
+        return R_base2gripper, t_base2gripper
     
-    def get_normal_in_base_frame(self, u, v, depth_frame):
+    def get_normal_in_base_frame(self, u, v, depth_frame, R_base2cam):
         """
         在基坐标系中计算法向量
         
         Args:
             u, v: 像素坐标
             depth_frame: 深度帧
+            R_base2cam: 相机坐标系到基坐标系的旋转矩阵（3x3）
         
         Returns:
             tuple: (normal_base, quality)
@@ -92,16 +102,27 @@ class PoseEstimator:
         plane_quality = 1.0 - (eigenvalues[sorted_indices[0]] / (eigenvalues[sorted_indices[2]] + 1e-10))
         plane_quality = np.clip(plane_quality, 0.0, 1.0)
 
-        normal_base = self.R_base2cam @ normal_cam
+        normal_base = R_base2cam @ normal_cam
         return normal_base, plane_quality
     
-    def calculate_robot_target(self, u, v, depth_frame):
+    def calculate_robot_target(
+        self,
+        u,
+        v,
+        depth_frame,
+        current_robot_pose,
+        target_euler_override=None,
+        enable_normal_estimation_override=None,
+    ):
         """
         计算机器人目标位姿
         
         Args:
             u, v: 像素坐标
             depth_frame: 深度帧
+            current_robot_pose: 当前机器人TCP位姿 [x, y, z, rx, ry, rz]
+            target_euler_override: 若提供，则强制使用该欧拉角作为目标姿态（用于“二次复拍只改xyz、保持rxryrz不变”）
+            enable_normal_estimation_override: 若提供，则覆盖全局 ENABLE_NORMAL_ESTIMATION
         
         Returns:
             tuple: (final_flange_pos, target_euler, quality)
@@ -109,6 +130,9 @@ class PoseEstimator:
                 - target_euler: 目标欧拉角 [rx, ry, rz]
                 - quality: 法向量质量 (0.0-1.0)
         """
+        if current_robot_pose is None:
+            return None
+
         dist = depth_frame.get_distance(u, v)
         if dist <= 0: 
             return None
@@ -117,36 +141,44 @@ class PoseEstimator:
         P_cam_mm = np.array(point_cam_m).reshape(3, 1) * 1000.0
         
         P_gripper = self.R_cam2gripper @ P_cam_mm + self.t_cam2gripper
-        P_surface_base = self.R_base2gripper_init @ P_gripper + self.t_base2gripper_init
+
+        R_base2gripper, t_base2gripper = self._pose_to_base2gripper(current_robot_pose)
+        P_surface_base = R_base2gripper @ P_gripper + t_base2gripper
         P_surface_base = P_surface_base.flatten()
         
-        target_euler = ROBOT_INITIAL_POSE[3:6]
-        target_normal_base = np.array([0, 0, 1])
-        quality = 0.0
-
-        if ENABLE_NORMAL_ESTIMATION:
-            normal_base, q = self.get_normal_in_base_frame(u, v, depth_frame)
-            if normal_base is not None and q > 0.3:
-                target_normal_base = normal_base
-                quality = q
-                
-                z_axis = -target_normal_base
-                z_axis = z_axis / np.linalg.norm(z_axis)
-                ref_axis = np.array([1.0, 0.0, 0.0])
-                if abs(z_axis[0]) > 0.9: 
-                    ref_axis = np.array([0.0, 1.0, 0.0])
-                y_axis = np.cross(z_axis, ref_axis)
-                y_axis = y_axis / np.linalg.norm(y_axis)
-                x_axis = np.cross(y_axis, z_axis)
-                x_axis = x_axis / np.linalg.norm(x_axis)
-                
-                R_target = np.column_stack([x_axis, y_axis, z_axis])
-                r_obj = R.from_matrix(R_target)
-                target_euler = r_obj.as_euler(DETECT_EULER_ORDER, degrees=True)
-            else:
-                R_target = self.R_base2gripper_init
+        # 默认：保持当前姿态（若二次复拍指定了 target_euler_override，则强制使用它）
+        if target_euler_override is not None:
+            target_euler = list(map(float, target_euler_override))
+            R_target = R.from_euler(DETECT_EULER_ORDER, target_euler, degrees=True).as_matrix()
+            quality = 1.0
         else:
-            R_target = self.R_base2gripper_init
+            target_euler = list(map(float, current_robot_pose[3:6]))
+            R_target = R_base2gripper
+            quality = 0.0
+
+            use_normal = ENABLE_NORMAL_ESTIMATION
+            if enable_normal_estimation_override is not None:
+                use_normal = bool(enable_normal_estimation_override)
+
+            if use_normal:
+                R_base2cam = R_base2gripper @ self.R_cam2gripper
+                normal_base, q = self.get_normal_in_base_frame(u, v, depth_frame, R_base2cam)
+                if normal_base is not None and q > 0.3:
+                    quality = q
+
+                    z_axis = -normal_base
+                    z_axis = z_axis / np.linalg.norm(z_axis)
+                    ref_axis = np.array([1.0, 0.0, 0.0])
+                    if abs(z_axis[0]) > 0.9:
+                        ref_axis = np.array([0.0, 1.0, 0.0])
+                    y_axis = np.cross(z_axis, ref_axis)
+                    y_axis = y_axis / np.linalg.norm(y_axis)
+                    x_axis = np.cross(y_axis, z_axis)
+                    x_axis = x_axis / np.linalg.norm(x_axis)
+
+                    R_target = np.column_stack([x_axis, y_axis, z_axis])
+                    r_obj = R.from_matrix(R_target)
+                    target_euler = r_obj.as_euler(DETECT_EULER_ORDER, degrees=True)
 
         # 计算偏移向量：沿法线方向的Z_OFFSET + 沿局部x和y方向的X_OFFSET和Y_OFFSET
         # 局部坐标系中的偏移向量 [X_OFFSET, Y_OFFSET, Z_OFFSET]
