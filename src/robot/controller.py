@@ -10,7 +10,7 @@ from ..detection.color_detector import detect_object
 from ..detection.pose_estimator import PoseEstimator
 from ..utils.text_renderer import draw_text_with_bg
 from ..config.detection_config import (
-    CALIB_FILE, ROBOT_INITIAL_POSE, Z_OFFSET, ENABLE_NORMAL_ESTIMATION, TOOL_LENGTH
+    CALIB_FILE, ROBOT_INITIAL_POSE, Z_OFFSET, ENABLE_NORMAL_ESTIMATION, TOOL_LENGTH, HOVER_HEIGHT
 )
 from ..config.robot_config import KEY_DEBOUNCE_TIME, DEFAULT_ROBOT_TOOL, DEFAULT_ROBOT_USER
 from .motion_handler import RobotMotionHandler
@@ -62,6 +62,9 @@ class RobotDetectController:
         
         # Z偏移量
         self.z_offset = Z_OFFSET
+        
+        # 悬浮高度（用于两阶段运动）
+        self.hover_height = HOVER_HEIGHT
     
     def get_current_pose(self):
         """获取当前机器人TCP位姿"""
@@ -90,15 +93,21 @@ class RobotDetectController:
             return False
     
     def move_to_saved_pose(self):
-        """移动到保存的检测到的物体坐标（因为有zoffset，直接移动）"""
+        """
+        两阶段移动到保存的检测到的物体坐标
+        第一阶段：移动到悬停位置（z坐标增加hover_height）
+        第二阶段：下降到目标位置
+        """
         if self.saved_pose is None:
             print("没有保存的检测坐标，请先按 'q' 暂停并保存检测到的物体坐标")
             return False
         
-        print(f"\n移动到检测到的物体坐标: [{self.saved_pose[0]:.3f}, {self.saved_pose[1]:.3f}, "
+        print(f"\n两阶段移动到检测到的物体坐标:")
+        print(f"  目标位置: [{self.saved_pose[0]:.3f}, {self.saved_pose[1]:.3f}, "
               f"{self.saved_pose[2]:.3f}, {self.saved_pose[3]:.3f}, {self.saved_pose[4]:.3f}, "
               f"{self.saved_pose[5]:.3f}]")
-        return self.motion_handler.move_to_pose(self.saved_pose)
+        print(f"  悬浮高度: {self.hover_height:.3f}mm")
+        return self.motion_handler.move_to_pose_two_stage(self.saved_pose, self.hover_height)
     
     def run(self):
         """主运行循环"""
@@ -107,6 +116,7 @@ class RobotDetectController:
             print(f"模式: {mode_text}")
             print(f"TCP补偿长度: {TOOL_LENGTH} mm")
             print(f"Z偏移量: {self.z_offset} mm")
+            print(f"悬浮高度: {self.hover_height} mm")
             # 平滑处理已禁用，直接使用原始检测值
             print("\n快捷键说明:")
             print("  'q' - 暂停/恢复，暂停时会保存检测到的物体坐标")

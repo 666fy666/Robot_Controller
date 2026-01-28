@@ -59,6 +59,7 @@ eyeInHand/
 - 实时检测和位姿计算
 - 暂停/恢复功能
 - 保存检测位姿并控制机器人移动
+- **两阶段运动控制**：先移动到悬停位置，再下降到目标位置，提高安全性
 - 多线程非阻塞运动控制
 - 紧急停止功能
 
@@ -98,6 +99,7 @@ DEFAULT_ROBOT_IP = '192.168.2.68'  # 修改为你的机器人IP
 - `ROBOT_INITIAL_POSE`: 机器人拍照时的初始位姿
 - `TOOL_LENGTH`: 工具/夹爪长度（mm）
 - `Z_OFFSET`: Z轴偏移量（mm）
+- `HOVER_HEIGHT`: 两阶段运动时的悬浮高度（mm）
 - `X_OFFSET`, `Y_OFFSET`: X、Y轴偏移补偿（mm）
 - `COLOR_RANGES`: 颜色检测阈值
 - `ENABLE_NORMAL_ESTIMATION`: 是否启用法向量估算
@@ -113,7 +115,7 @@ python robot_control.py
 ### 快捷键说明
 
 - **Q** - 暂停/恢复检测，暂停时会自动保存检测到的物体坐标
-- **W** - 暂停状态下，控制机器人移动到保存的检测坐标
+- **W** - 暂停状态下，控制机器人两阶段移动到保存的检测坐标（先悬停，再下降）
 - **B** - 回到初始位姿（全局快捷键）
 - **Z** - 停止机器人移动（全局快捷键）
 - **R** - 显示提示信息
@@ -141,6 +143,7 @@ python -m src.calibration.hand_eye_calibration
 - **ROBOT_INITIAL_POSE**: 机器人初始位姿 `[x, y, z, rx, ry, rz]`
 - **TOOL_LENGTH**: TCP补偿长度（mm）
 - **Z_OFFSET**: 法线方向偏移量（mm），用于避免碰撞
+- **HOVER_HEIGHT**: 两阶段运动时的悬浮高度（mm），控制第一阶段悬停位置
 - **X_OFFSET**, **Y_OFFSET**: 局部坐标系偏移补偿（mm）
 - **COLOR_RANGES**: HSV颜色阈值配置
 - **ENABLE_NORMAL_ESTIMATION**: 是否启用法向量估算
@@ -163,7 +166,7 @@ python -m src.calibration.hand_eye_calibration
    - 显示检测结果
 3. **控制**：
    - 按Q暂停并保存检测位姿
-   - 按W控制机器人移动到保存的位姿
+   - 按W控制机器人两阶段移动到保存的位姿（先移动到悬停位置，再下降到目标位置）
    - 按B回到初始位姿
 
 ## 注意事项
@@ -228,6 +231,11 @@ python -m src.calibration.hand_eye_calibration
 本项目仅供学习和研究使用。
 
 ## 更新日志
+
+### v2.1.0 (2026-01-28)
+- 新增两阶段运动控制功能
+- 添加HOVER_HEIGHT参数，支持可配置的悬浮高度
+- 优化机器人移动安全性，先悬停再下降
 
 ### v2.0.0 (2026-01-27)
 - 重构项目结构，采用模块化设计
