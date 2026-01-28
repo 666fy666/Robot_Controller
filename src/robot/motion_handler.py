@@ -95,6 +95,66 @@ class RobotMotionHandler:
             finally:
                 self.robot_moving = False
                 self.stop_requested = False
+
+    def _move_to_pose_two_pose_thread(
+        self,
+        first_pose,
+        second_pose,
+        first_stage_desc="第一阶段",
+        second_stage_desc="第二阶段",
+    ):
+        """
+        在后台线程中执行两段位姿序列移动
+        第一段：移动到 first_pose
+        第二段：移动到 second_pose
+
+        Args:
+            first_pose: 第一段目标位姿 [x, y, z, rx, ry, rz]
+            second_pose: 第二段目标位姿 [x, y, z, rx, ry, rz]
+            first_stage_desc: 第一阶段描述
+            second_stage_desc: 第二阶段描述
+        """
+        with self.robot_move_lock:
+            self.robot_moving = True
+            self.stop_requested = False  # 重置停止标志
+            try:
+                pose1 = first_pose.copy()
+                pose2 = second_pose.copy()
+
+                print(
+                    f"\n{first_stage_desc}：移动到中间位姿 "
+                    f"[{pose1[0]:.3f}, {pose1[1]:.3f}, {pose1[2]:.3f}, {pose1[3]:.3f}, {pose1[4]:.3f}, {pose1[5]:.3f}]"
+                )
+                error = self.robot.MoveL(pose1, self.tool, self.user)
+
+                if self.stop_requested:
+                    print(f"\n移动已被用户停止（{first_stage_desc}）")
+                    return
+                elif error != 0:
+                    print(f"\n{first_stage_desc}失败，错误码: {error}")
+                    return
+                else:
+                    print(f"\n{first_stage_desc}完成")
+
+                print(
+                    f"\n{second_stage_desc}：移动到目标位姿 "
+                    f"[{pose2[0]:.3f}, {pose2[1]:.3f}, {pose2[2]:.3f}, {pose2[3]:.3f}, {pose2[4]:.3f}, {pose2[5]:.3f}]"
+                )
+                error = self.robot.MoveL(pose2, self.tool, self.user)
+
+                if self.stop_requested:
+                    print(f"\n移动已被用户停止（{second_stage_desc}）")
+                elif error == 0:
+                    print(f"\n{second_stage_desc}完成")
+                    print("\n两段运动完成")
+                else:
+                    print(f"\n{second_stage_desc}失败，错误码: {error}")
+            except Exception as e:
+                if not self.stop_requested:
+                    print(f"\n移动过程中发生错误: {e}")
+            finally:
+                self.robot_moving = False
+                self.stop_requested = False
     
     def move_to_pose(self, pose):
         """
@@ -178,6 +238,37 @@ class RobotMotionHandler:
         
         # 在后台线程中执行两阶段移动
         self.move_thread = threading.Thread(target=self._move_to_pose_two_stage_thread, args=(target_pose, hover_height), daemon=True)
+        self.move_thread.start()
+        return True
+
+    def move_to_pose_two_pose(
+        self,
+        first_pose,
+        second_pose,
+        first_stage_desc="第一阶段",
+        second_stage_desc="第二阶段",
+    ):
+        """
+        两段位姿序列移动（非阻塞，在后台线程执行）
+
+        Args:
+            first_pose: 第一段目标位姿 [x, y, z, rx, ry, rz]
+            second_pose: 第二段目标位姿 [x, y, z, rx, ry, rz]
+            first_stage_desc: 第一阶段描述
+            second_stage_desc: 第二阶段描述
+
+        Returns:
+            bool: 是否成功启动移动
+        """
+        if self.robot_moving:
+            print("\n机器人正在移动中，请等待当前移动完成")
+            return False
+
+        self.move_thread = threading.Thread(
+            target=self._move_to_pose_two_pose_thread,
+            args=(first_pose, second_pose, first_stage_desc, second_stage_desc),
+            daemon=True,
+        )
         self.move_thread.start()
         return True
     

@@ -76,9 +76,29 @@ class RobotDetectController:
             return None
     
     def move_to_initial_pose(self):
-        """回到初始位姿"""
-        print(f"回到初始位姿: {self.initial_pose}")
-        return self.motion_handler.move_to_pose(self.initial_pose)
+        """
+        回到初始位姿（两阶段）
+        1) 先仅调整 z 到初始高度（避免碰撞）
+        2) 再调整其它参数回到初始位姿
+        """
+        current_pose = self.get_current_pose()
+        if current_pose is None:
+            # 获取当前位姿失败时，退化为直接回初始位姿
+            print(f"获取当前位姿失败，直接回到初始位姿: {self.initial_pose}")
+            return self.motion_handler.move_to_pose(self.initial_pose)
+
+        z_only_pose = current_pose.copy()
+        z_only_pose[2] = self.initial_pose[2]
+
+        print("\n两阶段回到初始位姿：")
+        print(f"  第一阶段：仅调整Z到初始高度 z={self.initial_pose[2]:.3f}mm")
+        print(f"  第二阶段：回到初始位姿 {self.initial_pose}")
+        return self.motion_handler.move_to_pose_two_pose(
+            z_only_pose,
+            self.initial_pose,
+            first_stage_desc="第一阶段：仅调整Z到初始高度",
+            second_stage_desc="第二阶段：回到初始位姿",
+        )
     
     def save_detected_pose(self):
         """保存检测到的物体坐标"""
@@ -117,7 +137,6 @@ class RobotDetectController:
             print(f"TCP补偿长度: {TOOL_LENGTH} mm")
             print(f"Z偏移量: {self.z_offset} mm")
             print(f"悬浮高度: {self.hover_height} mm")
-            # 平滑处理已禁用，直接使用原始检测值
             print("\n快捷键说明:")
             print("  'q' - 暂停/恢复，暂停时会保存检测到的物体坐标")
             print("  'w' - 暂停状态下，移动到检测到的物体坐标")
@@ -183,13 +202,6 @@ class RobotDetectController:
                         # 全局快捷键：停止机器人移动
                         self.motion_handler.stop_robot_motion()
                         self.last_key_time['z'] = current_time
-                
-                elif key == ord('r'):
-                    # 防抖：检查距离上次按r的时间
-                    if 'r' not in self.last_key_time or (current_time - self.last_key_time['r']) > self.key_debounce_time:
-                        # 平滑处理已禁用，此功能不再需要
-                        print("提示：平滑处理已禁用，检测值直接使用原始值")
-                        self.last_key_time['r'] = current_time
                 
                 elif key == 27:  # ESC
                     break
@@ -259,7 +271,7 @@ class RobotDetectController:
                     continue
                 
                 # 检测物体
-                center, found = detect_object(color_img)
+                center, found = detect_object(color_img, depth_frame)
                 
                 if found:
                     u, v = center
@@ -268,7 +280,7 @@ class RobotDetectController:
                     if result is not None:
                         raw_pos, raw_rot, normal_quality = result
                         
-                        # 直接使用原始检测值（已取消平滑处理）
+                        # 直接使用原始检测值
                         x, y, z = raw_pos
                         rx, ry, rz = raw_rot
                         
@@ -351,7 +363,6 @@ class RobotDetectController:
                                                      font_size=16, text_color=(255, 255, 255), 
                                                      bg_color=(0, 0, 255), alpha=0.5)
                 else:
-                    # 平滑处理已禁用，无需重置
                     pass
                 
                 paused_frame = color_img.copy()

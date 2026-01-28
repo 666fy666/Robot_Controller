@@ -15,7 +15,6 @@ eyeInHand/
 │   │   ├── __init__.py
 │   │   ├── color_detector.py    # 颜色物体检测
 │   │   ├── pose_estimator.py    # 位姿估算
-│   │   └── pose_filter.py       # 位姿平滑滤波器
 │   ├── robot/                    # 机器人控制模块
 │   │   ├── __init__.py
 │   │   ├── controller.py        # 机器人控制器
@@ -118,7 +117,6 @@ python robot_control.py
 - **W** - 暂停状态下，控制机器人两阶段移动到保存的检测坐标（先悬停，再下降）
 - **B** - 回到初始位姿（全局快捷键）
 - **Z** - 停止机器人移动（全局快捷键）
-- **R** - 显示提示信息
 - **ESC** - 退出程序
 
 ### 手眼标定
@@ -147,7 +145,6 @@ python -m src.calibration.hand_eye_calibration
 - **X_OFFSET**, **Y_OFFSET**: 局部坐标系偏移补偿（mm）
 - **COLOR_RANGES**: HSV颜色阈值配置
 - **ENABLE_NORMAL_ESTIMATION**: 是否启用法向量估算
-- **SMOOTH_ALPHA_POS**, **SMOOTH_ALPHA_ROT**: 位姿平滑系数
 
 ### 机器人配置 (`src/config/robot_config.py`)
 
