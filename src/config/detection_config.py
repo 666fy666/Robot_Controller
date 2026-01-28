@@ -66,19 +66,42 @@ DEPTH_FILTER_THRESHOLD = 0.01
 # 开始把侧面也吃进来（蓝色外扩到侧面）：反向把 TOP_FACE_DEPTH_BAND_M 或 TOP_FACE_NEAR_PERCENTILE 调小一点
 ENABLE_TOP_FACE_CENTER = True
 
+# 顶面选择增强：轮廓内多平面分割（RANSAC）
+# 适用于“正方体倾斜导致看到两面”的情况：在同一颜色轮廓里分离顶面/侧面，
+# 再用法向量（在 base 坐标系下 |n·Z| 最大）选择顶面。
+ENABLE_TOP_FACE_PLANE_RANSAC = True
+
+# 平面选择策略：
+# - "normal": 选 |n·Z_base| 最大的平面（更像“朝上”的顶面）
+# - "area": 选面积最大的平面（俯视为主时通常更稳）
+# - "hybrid": 综合法向与面积（可在两者之间折中）
+PLANE_SELECT_MODE = "area"
+PLANE_SELECT_HYBRID_ALPHA = 0.7  # hybrid 模式下法向权重（0~1），越大越偏向 normal
+
+# RANSAC 参数
+# - 阈值越小：平面更“干净”，但更容易因噪声导致失败
+# - 阈值越大：更鲁棒，但可能把相邻面也带进来
+PLANE_RANSAC_DIST_THRESH_M = 0.003  # 平面内点距离阈值（米）
+PLANE_RANSAC_MAX_ITERS = 200        # 迭代次数
+PLANE_RANSAC_MIN_INLIERS = 300      # 最少内点数（像素点）
+PLANE_RANSAC_MAX_POINTS = 5000      # 拟合时最多使用的点数（下采样上限）
+
+# 抓取点选择：距离变换最大点（更远离边界，避免落在棱边跨面）
+PLANE_GRASP_USE_DISTANCE_TRANSFORM = True
+
 # 近端分位数（0~100），越小越偏向“最靠近相机”的表面
-TOP_FACE_NEAR_PERCENTILE = 5
+TOP_FACE_NEAR_PERCENTILE = 6
 
 # 顶面深度带宽（单位：米）。越大越容易把侧面也包含进来；越小越容易漏检。
-TOP_FACE_DEPTH_BAND_M = 0.014
+TOP_FACE_DEPTH_BAND_M = 0.012
 
 # 顶面区域最小面积（像素），小于该面积则认为顶面提取失败并回退
-TOP_FACE_MIN_AREA_PX = 200
+TOP_FACE_MIN_AREA_PX = 300
 
+# ===============================================
 # 若深度不可用/顶面深度提取失败，是否尝试纯2D的“内部分割线”方案
 ENABLE_TOP_FACE_CENTER_2D_FALLBACK = True
 
-# ===============================================
 # 2D方案参数（在轮廓ROI内做 Canny + HoughLinesP 找顶面/侧面分割线）
 TOP_FACE_2D_CANNY_T1 = 60
 TOP_FACE_2D_CANNY_T2 = 160

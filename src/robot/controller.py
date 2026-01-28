@@ -270,8 +270,13 @@ class RobotDetectController:
                 if color_img is None:
                     continue
                 
-                # 检测物体
-                center, found = detect_object(color_img, depth_frame)
+                # 检测物体（启用：轮廓内双平面RANSAC选顶面）
+                center, found = detect_object(
+                    color_img,
+                    depth_frame,
+                    intrinsics=self.pose_estimator.intrinsics,
+                    R_base2cam=self.pose_estimator.R_base2cam,
+                )
                 
                 if found:
                     u, v = center

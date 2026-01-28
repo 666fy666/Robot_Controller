@@ -7,7 +7,15 @@ import numpy as np
 from ..config.detection_config import (
     COLOR_RANGES,
     ENABLE_TOP_FACE_CENTER,
+    ENABLE_TOP_FACE_PLANE_RANSAC,
     ENABLE_TOP_FACE_CENTER_2D_FALLBACK,
+    PLANE_SELECT_MODE,
+    PLANE_SELECT_HYBRID_ALPHA,
+    PLANE_GRASP_USE_DISTANCE_TRANSFORM,
+    PLANE_RANSAC_DIST_THRESH_M,
+    PLANE_RANSAC_MAX_ITERS,
+    PLANE_RANSAC_MAX_POINTS,
+    PLANE_RANSAC_MIN_INLIERS,
     TOP_FACE_DEPTH_BAND_M,
     TOP_FACE_NEAR_PERCENTILE,
     TOP_FACE_2D_CANNY_T1,
@@ -53,6 +61,285 @@ def _estimate_depth_scale_m(depth_frame, depth_raw, sample_uv):
         return dist_m / raw
     except Exception:
         return None
+
+
+def _vectorized_deproject_pixels_to_points(xs, ys, zs, intrinsics):
+    """
+    向量化像素反投影到相机坐标系（米）。
+    xs, ys: 像素坐标（numpy数组）
+    zs: 深度（米）（numpy数组）
+    intrinsics: pyrealsense2.intrinsics 或具备 fx/fy/ppx/ppy 属性的对象
+    """
+    fx = float(intrinsics.fx)
+    fy = float(intrinsics.fy)
+    ppx = float(intrinsics.ppx)
+    ppy = float(intrinsics.ppy)
+    x = (xs.astype(np.float32) - ppx) / fx * zs
+    y = (ys.astype(np.float32) - ppy) / fy * zs
+    z = zs.astype(np.float32)
+    return np.stack([x, y, z], axis=1)
+
+
+def _fit_plane_svd(points):
+    """
+    最小二乘拟合平面（SVD），返回单位法向量 n 和偏置 d（满足 n·p + d = 0）。
+    """
+    centroid = np.mean(points, axis=0)
+    _, _, vh = np.linalg.svd(points - centroid, full_matrices=False)
+    n = vh[-1]
+    n_norm = float(np.linalg.norm(n))
+    if n_norm <= 1e-9:
+        return None
+    n = n / n_norm
+    d = -float(np.dot(n, centroid))
+    return n, d
+
+
+def _ransac_plane(points, dist_thresh, max_iters, min_inliers, rng):
+    """
+    RANSAC 拟合平面。返回 (n, d, inlier_mask) 或 None。
+    points: (N,3)
+    """
+    n_points = int(points.shape[0])
+    if n_points < 3:
+        return None
+
+    best_inliers = None
+    best_count = 0
+    best_plane = None
+
+    # 早停阈值：如果某个模型解释了绝大多数点，就无需继续
+    early_stop = int(0.85 * n_points)
+
+    for _ in range(int(max_iters)):
+        idx = rng.choice(n_points, size=3, replace=False)
+        p1, p2, p3 = points[idx]
+        n = np.cross(p2 - p1, p3 - p1)
+        n_norm = float(np.linalg.norm(n))
+        if n_norm <= 1e-9:
+            continue
+        n = n / n_norm
+        d = -float(np.dot(n, p1))
+
+        dist = np.abs(points @ n + d)
+        inliers = dist < float(dist_thresh)
+        count = int(np.sum(inliers))
+        if count > best_count:
+            best_count = count
+            best_inliers = inliers
+            best_plane = (n, d)
+            if best_count >= early_stop:
+                break
+
+    if best_plane is None or best_inliers is None or best_count < int(min_inliers):
+        return None
+
+    # 用内点再做一次 SVD 精炼法向
+    refined = _fit_plane_svd(points[best_inliers])
+    if refined is None:
+        n, d = best_plane
+    else:
+        n, d = refined
+        # 使用精炼平面重新计算内点，保证一致
+        dist = np.abs(points @ n + d)
+        best_inliers = dist < float(dist_thresh)
+
+    if int(np.sum(best_inliers)) < int(min_inliers):
+        return None
+
+    return n, d, best_inliers
+
+
+def _plane_mask_to_largest_contour(mask_u8):
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, None
+    c = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(c))
+    return c, area
+
+
+def _pick_interior_point_by_distance_transform(bin_mask_u8):
+    """
+    在二值mask内选取距离边界最远的点（更稳的抓取点）。
+    """
+    if bin_mask_u8 is None:
+        return None
+    fg = (bin_mask_u8 > 0).astype(np.uint8)
+    if int(np.sum(fg)) < 10:
+        return None
+    dist = cv2.distanceTransform(fg, cv2.DIST_L2, 5)
+    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(dist)
+    if max_val <= 0:
+        return None
+    return int(max_loc[0]), int(max_loc[1])
+
+
+def _select_top_face_center_from_ransac_planes(depth_frame, contour, img_shape, intrinsics, R_base2cam=None):
+    """
+    方案B：轮廓ROI内做双平面RANSAC，按 |n·Z_base| 选顶面，
+    并用距离变换最大点选抓取点。
+
+    Returns:
+        (center_uv, top_contour, other_contour_or_None)
+    """
+    if depth_frame is None or intrinsics is None:
+        return None
+
+    h, w = img_shape[:2]
+    contour_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(contour_mask, [contour], -1, 255, thickness=-1)
+
+    try:
+        depth_raw = np.asanyarray(depth_frame.get_data()).astype(np.float32)
+    except Exception:
+        return None
+
+    if depth_raw.shape[0] != h or depth_raw.shape[1] != w:
+        return None
+
+    ys, xs = np.where((contour_mask > 0) & (depth_raw > 0))
+    if xs.size < max(200, int(PLANE_RANSAC_MIN_INLIERS)):
+        return None
+
+    # 估算 raw->米 的比例
+    sample_idx = int(xs.size // 2)
+    scale_m = _estimate_depth_scale_m(depth_frame, depth_raw, (int(xs[sample_idx]), int(ys[sample_idx])))
+    if scale_m is None or scale_m <= 0:
+        return None
+
+    depth_m = depth_raw * float(scale_m)
+    depth_m[depth_raw <= 0] = np.nan
+
+    zs = depth_m[ys, xs]
+    finite = np.isfinite(zs)
+    ys = ys[finite]
+    xs = xs[finite]
+    zs = zs[finite].astype(np.float32)
+    if xs.size < max(200, int(PLANE_RANSAC_MIN_INLIERS)):
+        return None
+
+    # 点数过多时下采样拟合（mask生成仍用全量点）
+    rng = np.random.default_rng()
+    if xs.size > int(PLANE_RANSAC_MAX_POINTS):
+        sel = rng.choice(xs.size, size=int(PLANE_RANSAC_MAX_POINTS), replace=False)
+        xs_fit = xs[sel]
+        ys_fit = ys[sel]
+        zs_fit = zs[sel]
+    else:
+        xs_fit, ys_fit, zs_fit = xs, ys, zs
+
+    points_fit = _vectorized_deproject_pixels_to_points(xs_fit, ys_fit, zs_fit, intrinsics)
+
+    plane1 = _ransac_plane(
+        points_fit,
+        dist_thresh=float(PLANE_RANSAC_DIST_THRESH_M),
+        max_iters=int(PLANE_RANSAC_MAX_ITERS),
+        min_inliers=int(PLANE_RANSAC_MIN_INLIERS),
+        rng=rng,
+    )
+    if plane1 is None:
+        return None
+
+    n1, d1, in1 = plane1
+    points_remain = points_fit[~in1]
+    plane2 = None
+    if points_remain.shape[0] >= max(200, int(PLANE_RANSAC_MIN_INLIERS)):
+        plane2 = _ransac_plane(
+            points_remain,
+            dist_thresh=float(PLANE_RANSAC_DIST_THRESH_M),
+            max_iters=int(PLANE_RANSAC_MAX_ITERS),
+            min_inliers=int(PLANE_RANSAC_MIN_INLIERS),
+            rng=rng,
+        )
+
+    # 计算 |n·Z_base| 分数（若未提供 R_base2cam，则退化为相机系Z）
+    def score_normal(n_cam):
+        if R_base2cam is not None:
+            n_base = (R_base2cam @ n_cam.reshape(3, 1)).reshape(3)
+        else:
+            n_base = n_cam
+        return float(abs(n_base[2]))
+
+    planes = [(n1, d1)]
+    if plane2 is not None:
+        n2, d2, _ = plane2
+        planes.append((n2, d2))
+
+    # 用全量点生成每个平面mask，并选“最像顶面”的那个
+    points_all = _vectorized_deproject_pixels_to_points(xs, ys, zs, intrinsics)
+
+    total_contour_area = float(cv2.contourArea(contour)) + 1e-6
+
+    best = None  # (score, tie_break, plane_idx, mask_u8, contour, area)
+    other_contour = None
+
+    for i, (n, d) in enumerate(planes):
+        dist = np.abs(points_all @ n + float(d))
+        inliers_all = dist < float(PLANE_RANSAC_DIST_THRESH_M)
+
+        plane_mask_u8 = np.zeros((h, w), dtype=np.uint8)
+        plane_mask_u8[ys[inliers_all], xs[inliers_all]] = 255
+
+        # 清理碎片
+        kernel = np.ones((5, 5), np.uint8)
+        plane_mask_u8 = cv2.morphologyEx(plane_mask_u8, cv2.MORPH_CLOSE, kernel)
+        plane_mask_u8 = cv2.morphologyEx(plane_mask_u8, cv2.MORPH_OPEN, kernel)
+
+        c, area = _plane_mask_to_largest_contour(plane_mask_u8)
+        if c is None or area is None:
+            continue
+        if area < float(TOP_FACE_MIN_AREA_PX):
+            continue
+
+        s_normal = score_normal(n)
+        s_area = float(area) / total_contour_area  # 0~1 归一化
+
+        mode = str(PLANE_SELECT_MODE).lower().strip()
+        if mode == "area":
+            s = float(area)  # 面积直接比较
+        elif mode == "hybrid":
+            alpha = float(np.clip(float(PLANE_SELECT_HYBRID_ALPHA), 0.0, 1.0))
+            s = alpha * s_normal + (1.0 - alpha) * s_area
+        else:
+            # default: "normal"
+            s = s_normal
+
+        # tie-break：优先更“朝上”的面，再优先面积更大
+        tie = (s_normal, float(area))
+        cand = (s, tie, i, plane_mask_u8, c, area)
+        if best is None or (cand[0] > best[0]) or (cand[0] == best[0] and cand[1] > best[1]):
+            best = cand
+
+    if best is None:
+        return None
+
+    _, _, best_idx, best_mask_u8, best_contour, _ = best
+
+    # 计算另一平面的轮廓（仅用于可视化）
+    if len(planes) > 1:
+        other_idx = 1 - best_idx
+        n, d = planes[other_idx]
+        dist = np.abs(points_all @ n + float(d))
+        inliers_all = dist < float(PLANE_RANSAC_DIST_THRESH_M)
+        other_mask_u8 = np.zeros((h, w), dtype=np.uint8)
+        other_mask_u8[ys[inliers_all], xs[inliers_all]] = 255
+        kernel = np.ones((5, 5), np.uint8)
+        other_mask_u8 = cv2.morphologyEx(other_mask_u8, cv2.MORPH_CLOSE, kernel)
+        other_mask_u8 = cv2.morphologyEx(other_mask_u8, cv2.MORPH_OPEN, kernel)
+        other_contour, _ = _plane_mask_to_largest_contour(other_mask_u8)
+
+    # 抓取点：优先用距离变换最大点，否则用轮廓质心
+    if bool(PLANE_GRASP_USE_DISTANCE_TRANSFORM):
+        center = _pick_interior_point_by_distance_transform(best_mask_u8)
+    else:
+        center = None
+    if center is None:
+        center = _centroid_from_contour(best_contour)
+    if center is None:
+        return None
+
+    return center, best_contour, other_contour
 
 
 def _select_top_face_center_from_depth(depth_frame, contour, img_shape):
@@ -239,13 +526,15 @@ def _select_top_face_center_from_2d(color_img, contour):
     return (cx, cy), picked_global, line_global
 
 
-def detect_object(color_img, depth_frame=None):
+def detect_object(color_img, depth_frame=None, intrinsics=None, R_base2cam=None):
     """
     检测多种颜色的物体
     
     Args:
         color_img: 彩色图像 (BGR格式)
         depth_frame: 深度帧（可选）。提供时将尝试仅输出“顶面中心点”
+        intrinsics: 相机内参（可选）。提供且 ENABLE_TOP_FACE_PLANE_RANSAC 为 True 时启用双平面RANSAC顶面选择
+        R_base2cam: 相机坐标系到基坐标系的旋转矩阵（可选）。用于按 |n·Z_base| 选顶面
     
     Returns:
         tuple: (center, found) 
@@ -285,20 +574,39 @@ def detect_object(color_img, depth_frame=None):
             top_center = None
             top_contour = None
             split_line = None
+            other_plane_contour = None
             if ENABLE_TOP_FACE_CENTER and depth_frame is not None:
-                result = _select_top_face_center_from_depth(depth_frame, c, color_img.shape)
-                if result is not None:
-                    top_center, top_contour = result
-            elif ENABLE_TOP_FACE_CENTER and ENABLE_TOP_FACE_CENTER_2D_FALLBACK:
-                result2d = _select_top_face_center_from_2d(color_img, c)
-                if result2d is not None:
-                    top_center, top_contour, split_line = result2d
+                # 优先：方案B（轮廓内双平面RANSAC）
+                if bool(ENABLE_TOP_FACE_PLANE_RANSAC) and intrinsics is not None:
+                    result_plane = _select_top_face_center_from_ransac_planes(
+                        depth_frame=depth_frame,
+                        contour=c,
+                        img_shape=color_img.shape,
+                        intrinsics=intrinsics,
+                        R_base2cam=R_base2cam,
+                    )
+                    if result_plane is not None:
+                        top_center, top_contour, other_plane_contour = result_plane
+
+                # 回退：原始“近端深度层”方案
+                if top_center is None or top_contour is None:
+                    result = _select_top_face_center_from_depth(depth_frame, c, color_img.shape)
+                    if result is not None:
+                        top_center, top_contour = result
+
+                # 深度可用但顶面提取失败时，也尝试2D回退
+                if (top_center is None or top_contour is None) and bool(ENABLE_TOP_FACE_CENTER_2D_FALLBACK):
+                    result2d = _select_top_face_center_from_2d(color_img, c)
+                    if result2d is not None:
+                        top_center, top_contour, split_line = result2d
 
             # 可视化
             cv2.drawContours(color_img, [c], -1, (0, 255, 0), 2)
             if top_center is not None and top_contour is not None:
                 cx, cy = top_center
                 cv2.drawContours(color_img, [top_contour], -1, (255, 0, 0), 2)
+                if other_plane_contour is not None:
+                    cv2.drawContours(color_img, [other_plane_contour], -1, (255, 255, 0), 2)
                 if split_line is not None:
                     x1, y1, x2, y2 = split_line
                     cv2.line(color_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
